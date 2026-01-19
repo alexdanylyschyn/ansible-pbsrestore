@@ -1,0 +1,247 @@
+# roles/pbs-restore/tasks/main.yml
+---
+- name: Perform restore
+  block:
+    - name: Check destination path status
+      ansible.builtin.stat:
+        path: "{{ destination_path }}"
+      register: dest_stat
+
+    - name: Check if destination directory is empty (if it exists and is a directory)
+      ansible.builtin.find:
+        paths: "{{ destination_path }}"
+        file_type: any
+        hidden: true
+      register: dest_contents
+      when:
+        - dest_stat.stat.exists
+        - dest_stat.stat.isdir
+        - not (force_restore | default(false))
+
+    - name: Determine if restore is needed
+      ansible.builtin.set_fact:
+        should_restore: >-
+          {{
+            force_restore | default(false) or
+            not dest_stat.stat.exists or
+            (dest_stat.stat.isdir and (dest_contents.matched | default(0)) == 0) or
+            (dest_stat.stat.isreg and dest_stat.stat.size == 0)
+          }}
+
+    - name: Skip restore if destination already has content
+      ansible.builtin.debug:
+        msg: "Skipping restore - {{ destination_path }} already exists and has content (use force_restore: true to override)"
+      when: not should_restore
+
+    - name: Verify destination is writable
+      ansible.builtin.file:
+        path: "{{ destination_path if dest_stat.stat.exists else (destination_path | dirname) }}"
+        state: directory
+        mode: "0755"
+      when: should_restore
+      check_mode: true
+      register: writable_check
+      failed_when: false
+
+    - name: Fail if destination is not writable
+      ansible.builtin.fail:
+        msg: "Destination path {{ destination_path }} is not writable"
+      when:
+        - should_restore
+        - writable_check is failed
+
+    - name: Backup existing destination if forcing restore
+      ansible.builtin.command:
+        cmd: "mv {{ destination_path }} {{ destination_path }}.backup.{{ ansible_date_time.epoch }}"
+      when:
+        - should_restore
+        - force_restore | default(false)
+        - dest_stat.stat.exists
+      changed_when: true
+
+    - name: Add Proxmox repository GPG key (Trixie)
+      ansible.builtin.get_url:
+        url: https://enterprise.proxmox.com/debian/proxmox-release-trixie.gpg
+        dest: /etc/apt/keyrings/proxmox-release-trixie.gpg
+        mode: "0644"
+      when:
+        - should_restore
+        - ansible_distribution == "Debian"
+        - ansible_distribution_major_version == "13"
+
+    - name: Add Proxmox repository GPG key (Bookworm)
+      ansible.builtin.get_url:
+        url: https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+        dest: /etc/apt/keyrings/proxmox-release-bookworm.gpg
+        mode: "0644"
+      when:
+        - should_restore
+        - ansible_distribution == "Debian"
+        - ansible_distribution_major_version == "12"
+
+    - name: Determine PBS repository configuration
+      ansible.builtin.set_fact:
+        pbs_repo_release: "{{ ansible_distribution_release }}"
+        pbs_gpg_key: "/etc/apt/keyrings/proxmox-release-{{ ansible_distribution_release }}.gpg"
+      when:
+        - should_restore
+        - ansible_distribution == "Debian"
+
+    - name: Add Proxmox Backup Client repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ pbs_gpg_key }}] http://download.proxmox.com/debian/pbs-client {{ pbs_repo_release }} main"
+        state: present
+        filename: pbs-client
+      when:
+        - should_restore
+        - ansible_distribution == "Debian"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      when:
+        - should_restore
+        - ansible_distribution == "Debian"
+
+    - name: Install proxmox-backup-client and jq
+      ansible.builtin.apt:
+        name:
+          - proxmox-backup-client
+          - jq
+        state: present
+      when: should_restore
+
+    - name: Ensure PBS credentials file exists
+      ansible.builtin.copy:
+        content: "{{ pbs_credentials }}"
+        dest: /etc/pbs-credentials
+        mode: "0600"
+        owner: root
+        group: root
+      when:
+        - should_restore
+        - pbs_credentials is defined
+      no_log: true
+
+    - name: Get latest backup timestamp for container
+      ansible.builtin.shell: |
+        set -o pipefail
+        proxmox-backup-client list \
+          --repository "{{ pbs_repository }}" \
+          --output-format json \
+          | jq -r '.[] | select(.["backup-type"] == "{{ backup_type }}" and .["backup-id"] == "{{ ct_id }}") | .["backup-time"]' \
+          | sort -r | head -1
+      args:
+        executable: /bin/bash
+      environment:
+        PBS_REPOSITORY: "{{ pbs_repository }}"
+        PBS_PASSWORD: "{{ pbs_password | default(omit) }}"
+        PBS_PASSWORD_FILE: "{{ '/etc/pbs-credentials' if pbs_credentials is defined else omit }}"
+      register: latest_backup_result
+      changed_when: false
+      failed_when: latest_backup_result.stdout == ""
+      when:
+        - should_restore
+        - backup_time is not defined or backup_time == "latest"
+
+    - name: Set backup time to use
+      ansible.builtin.set_fact:
+        backup_time_to_use: "{{ backup_time if (backup_time is defined and backup_time != 'latest') else latest_backup_result.stdout }}"
+      when: should_restore
+
+    - name: Create temporary extraction directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: pbs-extract-
+      register: temp_extract_dir
+      when: should_restore
+
+    - name: Restore specific path from PBS backup
+      ansible.builtin.shell: |
+        set -e
+        set -o pipefail
+
+        # Build the snapshot path
+        SNAPSHOT="{{ backup_type }}/{{ ct_id }}/{{ backup_time_to_use }}"
+
+        # Change to temp directory
+        cd "{{ temp_extract_dir.path }}"
+
+        # Restore the specific archive path
+        # The source_path needs to be relative (without leading /)
+        SOURCE_REL="{{ source_path | regex_replace('^/', '') }}"
+
+        proxmox-backup-client restore "$SNAPSHOT" \
+          "$SOURCE_REL" \
+          --repository "{{ pbs_repository }}"
+
+        # Ensure destination directory exists
+        mkdir -p "{{ destination_path }}"
+
+        # Copy extracted files to destination
+        if [ -d "{{ temp_extract_dir.path }}/{{ source_path }}" ]; then
+          # Source path is a directory
+          cp -a "{{ temp_extract_dir.path }}{{ source_path }}"/* "{{ destination_path }}/"
+        elif [ -d "{{ temp_extract_dir.path }}/$SOURCE_REL" ]; then
+          # Try without leading slash
+          cp -a "{{ temp_extract_dir.path }}/$SOURCE_REL"/* "{{ destination_path }}/"
+        else
+          echo "Could not find extracted files at expected path"
+          ls -la "{{ temp_extract_dir.path }}"
+          exit 1
+        fi
+
+        {% if file_owner is defined and file_group is defined %}
+        # Fix ownership if specified
+        chown -R "{{ file_owner }}:{{ file_group }}" "{{ destination_path }}"
+        {% endif %}
+      args:
+        executable: /bin/bash
+      environment:
+        PBS_REPOSITORY: "{{ pbs_repository }}"
+        PBS_PASSWORD: "{{ pbs_password | default(omit) }}"
+        PBS_PASSWORD_FILE: "{{ '/etc/pbs-credentials' if pbs_credentials is defined else omit }}"
+      when:
+        - should_restore
+        - backup_type is defined
+        - ct_id is defined
+        - source_path is defined
+        - destination_path is defined
+      changed_when: true
+
+  always:
+    - name: Remove temporary extraction directory
+      ansible.builtin.file:
+        path: "{{ temp_extract_dir.path }}"
+        state: absent
+      when:
+        - temp_extract_dir is defined
+        - temp_extract_dir.path is defined
+
+    - name: Remove PBS credentials file
+      ansible.builtin.file:
+        path: /etc/pbs-credentials
+        state: absent
+      when:
+        - should_restore | default(false)
+        - pbs_credentials is defined
+
+    - name: Remove proxmox-backup-client package
+      ansible.builtin.apt:
+        name:
+          - proxmox-backup-client
+          - jq
+        state: absent
+        purge: true
+        autoremove: true
+      when: should_restore | default(false)
+
+    - name: Remove PBS client repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ pbs_gpg_key }}] http://download.proxmox.com/debian/pbs-client {{ pbs_repo_release }} main"
+        state: absent
+        filename: pbs-client
+      when:
+        - should_restore | default(false)
+        - ansible_distribution == "Debian"
+        - pbs_gpg_key is defined

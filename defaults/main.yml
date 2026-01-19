@@ -1,0 +1,9 @@
+# roles/pbs-restore/defaults/main.yml
+---
+pbs_repository: ""
+backup_type: "ct"
+backup_time: "latest" # Set to "latest" to auto-detect, or specify a timestamp
+preserve_permissions: true
+file_owner: "root"
+file_group: "root"
+force_restore: false # Set to true to restore even if destination has content
