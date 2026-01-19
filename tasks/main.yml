@@ -33,12 +33,6 @@
         msg: "Skipping restore - {{ destination_path }} already exists and has content (use force_restore: true to override)"
       when: not should_restore
 
-    - name: Extract password from credentials
-      ansible.builtin.set_fact:
-        pbs_password: "{{ pbs_credentials.split(':')[1] }}"
-      when: should_restore
-      no_log: true
-
     - name: Verify destination is writable
       ansible.builtin.file:
         path: "{{ destination_path if dest_stat.stat.exists else (destination_path | dirname) }}"
@@ -117,16 +111,6 @@
         state: present
       when: should_restore
 
-    - name: Ensure PBS credentials file exists
-      ansible.builtin.copy:
-        content: "{{ pbs_credentials }}"
-        dest: /etc/pbs-credentials
-        mode: "0600"
-        owner: root
-        group: root
-      when: should_restore
-      no_log: true
-
     - name: Get latest backup timestamp for container
       ansible.builtin.shell: |
         set -o pipefail
@@ -138,14 +122,14 @@
       args:
         executable: /bin/bash
       environment:
-        PBS_REPOSITORY: "{{ pbs_repository }}"
-        PBS_PASSWORD: "{{ pbs_password }}"
+        PBS_PASSWORD: "{{ pbs_token_secret }}"
       register: latest_backup_result
       changed_when: false
       failed_when: latest_backup_result.stdout == ""
       when:
         - should_restore
         - backup_time is not defined or backup_time == "latest"
+      no_log: true
 
     - name: Set backup time to use
       ansible.builtin.set_fact:
@@ -201,8 +185,7 @@
       args:
         executable: /bin/bash
       environment:
-        PBS_REPOSITORY: "{{ pbs_repository }}"
-        PBS_PASSWORD: "{{ pbs_password }}"
+        PBS_PASSWORD: "{{ pbs_token_secret }}"
       when:
         - should_restore
         - backup_type is defined
@@ -210,6 +193,7 @@
         - source_path is defined
         - destination_path is defined
       changed_when: true
+      no_log: true
 
   always:
     - name: Remove temporary extraction directory
@@ -219,12 +203,6 @@
       when:
         - temp_extract_dir is defined
         - temp_extract_dir.path is defined
-
-    - name: Remove PBS credentials file
-      ansible.builtin.file:
-        path: /etc/pbs-credentials
-        state: absent
-      when: should_restore | default(false)
 
     - name: Remove proxmox-backup-client package
       ansible.builtin.apt:

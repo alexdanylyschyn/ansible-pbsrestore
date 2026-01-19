@@ -1,7 +1,7 @@
 # roles/pbs-restore/defaults/main.yml
 ---
 pbs_repository: ""
-pbs_credentials: ""
+pbs_token_secret: ""
 backup_type: "ct"
 backup_time: "latest"
 preserve_permissions: true
