@@ -33,6 +33,12 @@
         msg: "Skipping restore - {{ destination_path }} already exists and has content (use force_restore: true to override)"
       when: not should_restore
 
+    - name: Extract password from credentials
+      ansible.builtin.set_fact:
+        pbs_password: "{{ pbs_credentials.split(':')[1] }}"
+      when: should_restore
+      no_log: true
+
     - name: Verify destination is writable
       ansible.builtin.file:
         path: "{{ destination_path if dest_stat.stat.exists else (destination_path | dirname) }}"
@@ -118,9 +124,7 @@
         mode: "0600"
         owner: root
         group: root
-      when:
-        - should_restore
-        - pbs_credentials is defined
+      when: should_restore
       no_log: true
 
     - name: Get latest backup timestamp for container
@@ -135,8 +139,7 @@
         executable: /bin/bash
       environment:
         PBS_REPOSITORY: "{{ pbs_repository }}"
-        PBS_PASSWORD: "{{ pbs_password | default(omit) }}"
-        PBS_PASSWORD_FILE: "{{ '/etc/pbs-credentials' if pbs_credentials is defined else omit }}"
+        PBS_PASSWORD: "{{ pbs_password }}"
       register: latest_backup_result
       changed_when: false
       failed_when: latest_backup_result.stdout == ""
@@ -192,15 +195,14 @@
         fi
 
         {% if file_owner is defined and file_group is defined %}
-        # Fix ownership if specified
+        # Fix ownership if specified (accepts both names and numeric IDs)
         chown -R "{{ file_owner }}:{{ file_group }}" "{{ destination_path }}"
         {% endif %}
       args:
         executable: /bin/bash
       environment:
         PBS_REPOSITORY: "{{ pbs_repository }}"
-        PBS_PASSWORD: "{{ pbs_password | default(omit) }}"
-        PBS_PASSWORD_FILE: "{{ '/etc/pbs-credentials' if pbs_credentials is defined else omit }}"
+        PBS_PASSWORD: "{{ pbs_password }}"
       when:
         - should_restore
         - backup_type is defined
@@ -222,9 +224,7 @@
       ansible.builtin.file:
         path: /etc/pbs-credentials
         state: absent
-      when:
-        - should_restore | default(false)
-        - pbs_credentials is defined
+      when: should_restore | default(false)
 
     - name: Remove proxmox-backup-client package
       ansible.builtin.apt:
