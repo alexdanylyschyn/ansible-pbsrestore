@@ -111,30 +111,58 @@
         state: present
       when: should_restore
 
-    - name: Get latest backup timestamp for container
+    - name: Get latest backup for container
       ansible.builtin.shell: |
         set -o pipefail
-        proxmox-backup-client list \
+        proxmox-backup-client snapshots \
           --repository "{{ pbs_repository }}" \
           --output-format json \
-          | jq -r '.[] | select(.["backup-type"] == "{{ backup_type }}" and .["backup-id"] == "{{ ct_id }}") | .["backup-time"]' \
-          | sort -r | head -1
+          | jq -r '.[] | select(.["backup-type"] == "{{ backup_type }}" and (.["backup-id"] | tostring) == "{{ ct_id }}")' \
+          | jq -s 'sort_by(.["backup-time"]) | last | .["backup-time"]'
       args:
         executable: /bin/bash
       environment:
         PBS_PASSWORD: "{{ pbs_token_secret }}"
-      register: latest_backup_result
+      register: latest_backup_timestamp
       changed_when: false
-      failed_when: latest_backup_result.stdout == ""
       when:
         - should_restore
         - backup_time is not defined or backup_time == "latest"
-      no_log: true
+
+    - name: Convert Unix timestamp to ISO 8601 format
+      ansible.builtin.shell: |
+        date -u -d @{{ latest_backup_timestamp.stdout }} +%Y-%m-%dT%H:%M:%SZ
+      args:
+        executable: /bin/bash
+      register: backup_time_converted
+      changed_when: false
+      when:
+        - should_restore
+        - latest_backup_timestamp is defined
+        - latest_backup_timestamp.stdout != ""
+        - backup_time is not defined or backup_time == "latest"
 
     - name: Set backup time to use
       ansible.builtin.set_fact:
-        backup_time_to_use: "{{ backup_time if (backup_time is defined and backup_time != 'latest') else latest_backup_result.stdout }}"
+        backup_time_to_use: >-
+          {{
+            backup_time if (backup_time is defined and backup_time != 'latest' and backup_time != '')
+            else (backup_time_converted.stdout if backup_time_converted is defined else None)
+          }}
       when: should_restore
+
+    - name: Debug backup time
+      ansible.builtin.debug:
+        msg: "Using backup timestamp: {{ backup_time_to_use }}"
+      when: should_restore
+
+    - name: Fail if no backup timestamp found
+      ansible.builtin.fail:
+        msg: |
+          No backup snapshot found for container {{ ct_id }} of type {{ backup_type }} in repository {{ pbs_repository }}
+      when:
+        - should_restore
+        - backup_time_to_use is not defined or backup_time_to_use == None or backup_time_to_use == "" or backup_time_to_use == "null"
 
     - name: Create temporary extraction directory
       ansible.builtin.tempfile:
@@ -151,37 +179,50 @@
         # Build the snapshot path
         SNAPSHOT="{{ backup_type }}/{{ ct_id }}/{{ backup_time_to_use }}"
 
-        # Change to temp directory
-        cd "{{ temp_extract_dir.path }}"
+        # The archive name for CT backups is typically "root.pxar.didx"
+        ARCHIVE_NAME="root.pxar.didx"
 
-        # Restore the specific archive path
+        # Target directory for extraction
+        TARGET_DIR="{{ temp_extract_dir.path }}"
+
         # The source_path needs to be relative (without leading /)
         SOURCE_REL="{{ source_path | regex_replace('^/', '') }}"
 
+        echo "Restoring from snapshot: $SNAPSHOT"
+        echo "Archive: $ARCHIVE_NAME"
+        echo "Pattern: $SOURCE_REL"
+
+        # Restore with pattern matching
         proxmox-backup-client restore "$SNAPSHOT" \
-          "$SOURCE_REL" \
-          --repository "{{ pbs_repository }}"
+          "$ARCHIVE_NAME" \
+          "$TARGET_DIR" \
+          --repository "{{ pbs_repository }}" \
+          --pattern "$SOURCE_REL/**"
+
+        echo "Extraction complete, checking files..."
+        ls -la "$TARGET_DIR"
 
         # Ensure destination directory exists
         mkdir -p "{{ destination_path }}"
 
         # Copy extracted files to destination
-        if [ -d "{{ temp_extract_dir.path }}/{{ source_path }}" ]; then
-          # Source path is a directory
-          cp -a "{{ temp_extract_dir.path }}{{ source_path }}"/* "{{ destination_path }}/"
-        elif [ -d "{{ temp_extract_dir.path }}/$SOURCE_REL" ]; then
-          # Try without leading slash
-          cp -a "{{ temp_extract_dir.path }}/$SOURCE_REL"/* "{{ destination_path }}/"
+        if [ -d "$TARGET_DIR/$SOURCE_REL" ]; then
+          echo "Found directory at $TARGET_DIR/$SOURCE_REL"
+          cp -a "$TARGET_DIR/$SOURCE_REL"/* "{{ destination_path }}/"
         else
-          echo "Could not find extracted files at expected path"
-          ls -la "{{ temp_extract_dir.path }}"
+          echo "ERROR: Could not find extracted files at $TARGET_DIR/$SOURCE_REL"
+          echo "Contents of temp directory:"
+          find "$TARGET_DIR" -type d
           exit 1
         fi
 
         {% if file_owner is defined and file_group is defined %}
         # Fix ownership if specified (accepts both names and numeric IDs)
+        echo "Setting ownership to {{ file_owner }}:{{ file_group }}"
         chown -R "{{ file_owner }}:{{ file_group }}" "{{ destination_path }}"
         {% endif %}
+
+        echo "Restore completed successfully"
       args:
         executable: /bin/bash
       environment:
@@ -193,7 +234,7 @@
         - source_path is defined
         - destination_path is defined
       changed_when: true
-      no_log: true
+      register: restore_output
 
   always:
     - name: Remove temporary extraction directory
