@@ -190,29 +190,32 @@
 
         echo "Restoring from snapshot: $SNAPSHOT"
         echo "Archive: $ARCHIVE_NAME"
-        echo "Pattern: $SOURCE_REL"
+        echo "Source path: $SOURCE_REL"
 
-        # Restore with pattern matching
+        # Restore only the specific path (pattern must match directory structure in pxar)
+        # Use multiple patterns to ensure we get the directory and all its contents
         proxmox-backup-client restore "$SNAPSHOT" \
           "$ARCHIVE_NAME" \
           "$TARGET_DIR" \
           --repository "{{ pbs_repository }}" \
-          --pattern "$SOURCE_REL/**"
+          --allow-existing-dirs \
+          --pattern "$SOURCE_REL" \
+          --pattern "$SOURCE_REL/**/*"
 
-        echo "Extraction complete, checking files..."
-        ls -la "$TARGET_DIR"
+        echo "Extraction complete, checking what was extracted..."
+        ls -laR "$TARGET_DIR/$SOURCE_REL" 2>&1 | head -100 || echo "Path not found"
 
         # Ensure destination directory exists
         mkdir -p "{{ destination_path }}"
 
-        # Copy extracted files to destination
+        # Copy extracted files to destination (including empty directories)
         if [ -d "$TARGET_DIR/$SOURCE_REL" ]; then
           echo "Found directory at $TARGET_DIR/$SOURCE_REL"
-          cp -a "$TARGET_DIR/$SOURCE_REL"/* "{{ destination_path }}/"
+          cp -a "$TARGET_DIR/$SOURCE_REL/." "{{ destination_path }}/"
         else
           echo "ERROR: Could not find extracted files at $TARGET_DIR/$SOURCE_REL"
-          echo "Contents of temp directory:"
-          find "$TARGET_DIR" -type d
+          echo "Directory structure:"
+          find "$TARGET_DIR" -type d | head -50
           exit 1
         fi
 
