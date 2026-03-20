@@ -139,7 +139,7 @@
       when:
         - should_restore
         - latest_backup_timestamp is defined
-        - latest_backup_timestamp.stdout != ""
+        - "'stdout' in latest_backup_timestamp"
         - backup_time is not defined or backup_time == "latest"
 
     - name: Set backup time to use
